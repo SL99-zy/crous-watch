@@ -33,6 +33,8 @@ from pathlib import Path
 from urllib.parse import urlencode, urlparse, parse_qs, urlunparse
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 
 # --------------------------------------------------------------------------- #
@@ -304,6 +306,28 @@ def total_count(html: str) -> int | None:
     return None
 
 
+def build_session() -> requests.Session:
+    """A requests Session that automatically retries transient failures
+    (connection errors and 429/5xx) a few times with exponential backoff,
+    so a momentary glitch doesn't cost us a whole cycle's check for a city."""
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": USER_AGENT,
+        "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+    })
+    retry = Retry(
+        total=3,                       # up to 3 retries
+        backoff_factor=0.5,            # waits ~0.5s, 1s, 2s between tries
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET"]),
+        respect_retry_after_header=True,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
 def fetch_search(session: requests.Session, url: str) -> dict[str, dict] | None:
     """Fetch all pages of one search URL.
 
@@ -560,11 +584,7 @@ def main() -> int:
         log.error("Telegram not configured. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.")
         return 1
 
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": USER_AGENT,
-        "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
-    })
+    session = build_session()
     state = load_state()
 
     if args.once:
