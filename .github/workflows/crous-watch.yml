@@ -1,0 +1,55 @@
+name: crous-watch
+
+# Runs on a schedule. GitHub Actions has NO always-on process — instead it fires
+# this job every N minutes, each run does one --once pass, and we cache seen.json
+# between runs so you are only alerted about genuinely new listings.
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 min (see notes in README about timing)
+  workflow_dispatch: {}      # lets you run it manually from the Actions tab
+
+concurrency:
+  group: crous-watch         # never let two runs overlap
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      # Bring back the "already seen" state from the previous run.
+      - name: Restore seen-state
+        uses: actions/cache/restore@v4
+        with:
+          path: seen.json
+          key: crous-seen-${{ github.run_id }}
+          restore-keys: |
+            crous-seen-
+
+      - name: Run watcher (single pass)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Pre-resolved city bounding boxes (Reims, Rennes, Troyes, Nice,
+          # Toulon, Lille, Corte) on campaign tools/42. No geocoder needed in CI.
+          # To change cities: run locally with CITIES=... to print fresh URLs,
+          # or edit this line. Update /tools/42/ when the campaign changes.
+          SEARCH_URLS: >-
+            https://trouverunlogement.lescrous.fr/tools/42/search?bounds=3.9858192_49.303187_4.1302563_49.2039186|https://trouverunlogement.lescrous.fr/tools/42/search?bounds=-1.7525876_48.1549705_-1.6244045_48.0769155|https://trouverunlogement.lescrous.fr/tools/42/search?bounds=4.0411689_48.3185905_4.1111417_48.2663185|https://trouverunlogement.lescrous.fr/tools/42/search?bounds=7.1819535_43.7607635_7.323912_43.6454189|https://trouverunlogement.lescrous.fr/tools/42/search?bounds=5.8795028_43.171494_5.9873841_43.1010435|https://trouverunlogement.lescrous.fr/tools/42/search?bounds=2.9679677_50.6612596_3.125725_50.6008363|https://trouverunlogement.lescrous.fr/tools/42/search?bounds=8.926502_42.344665_9.211775_42.203174
+          NOTIFY_ON_FIRST_RUN: "false"
+        run: python crous_watch.py --once
+
+      # Save the updated state for the next run.
+      - name: Save seen-state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: seen.json
+          key: crous-seen-${{ github.run_id }}

@@ -1,0 +1,10 @@
+# Never commit secrets or local state
+.env
+seen.json
+test_seen.json
+demo_seen.json
+
+# Python
+.venv/
+__pycache__/
+*.pyc
