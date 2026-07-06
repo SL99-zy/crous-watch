@@ -1,0 +1,19 @@
+[Unit]
+Description=crous-watch CROUS housing notifier
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/crous-watch
+# The script reads .env from WorkingDirectory itself, so no EnvironmentFile needed.
+ExecStart=/home/ec2-user/crous-watch/.venv/bin/python /home/ec2-user/crous-watch/crous_watch.py
+Restart=always
+RestartSec=15
+# Don't hammer restarts if something is badly broken
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target
