@@ -86,6 +86,7 @@ JITTER = int(os.environ.get("JITTER", "60"))                     # random extra 
 PAGE_DELAY = float(os.environ.get("PAGE_DELAY", "1.5"))          # polite delay between pages
 MAX_PAGES = int(os.environ.get("MAX_PAGES", "20"))               # safety cap on pagination
 STATE_FILE = os.environ.get("STATE_FILE", "seen.json")
+GEOCODE_CACHE_FILE = os.environ.get("GEOCODE_CACHE_FILE", "geocode_cache.json")
 # On the very first run for a search, seed silently instead of alerting on the
 # entire current inventory. Set to "true" if you WANT the first batch too.
 NOTIFY_ON_FIRST_RUN = os.environ.get("NOTIFY_ON_FIRST_RUN", "false").lower() == "true"
@@ -138,13 +139,23 @@ def telegram_send(text: str) -> bool:
 # --------------------------------------------------------------------------- #
 # Scraping
 # --------------------------------------------------------------------------- #
-def geocode_city(city: str) -> str | None:
-    """
-    Turn a city name into a CROUS search URL by looking up its bounding box
-    via OpenStreetMap's free Nominatim geocoder (no API key needed).
+def _load_geocode_cache() -> dict:
+    p = Path(GEOCODE_CACHE_FILE)
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            pass
+    return {}
 
-    CROUS bounds format is: <west_lon>_<north_lat>_<east_lon>_<south_lat>
-    """
+
+def _geocode_bounds(city: str) -> str | None:
+    """Return the CROUS 'bounds' string for a city, using a disk cache first so a
+    Nominatim outage at restart doesn't drop cities. Only the raw bounds are
+    cached (the URL is rebuilt with the current TOOL_ID)."""
+    key = city.strip().lower()
+    cache = _load_geocode_cache()
+
     try:
         r = requests.get(
             "https://nominatim.openstreetmap.org/search",
@@ -157,16 +168,30 @@ def geocode_city(city: str) -> str | None:
         data = r.json()
         if not data:
             log.warning("City not found by geocoder: %s", city)
-            return None
+            return cache.get(key)  # fall back to cache if we ever had it
         # Nominatim boundingbox = [south_lat, north_lat, west_lon, east_lon]
         south, north, west, east = map(float, data[0]["boundingbox"])
         bounds = f"{west}_{north}_{east}_{south}"
-        url = f"{BASE}/tools/{TOOL_ID}/search?bounds={bounds}"
-        log.info("City '%s' -> %s", city, url)
-        return url
+        if cache.get(key) != bounds:
+            cache[key] = bounds
+            _atomic_write(GEOCODE_CACHE_FILE, json.dumps(cache, ensure_ascii=False, indent=2))
+        return bounds
     except (requests.RequestException, ValueError, KeyError, IndexError) as e:
-        log.warning("Geocoding failed for '%s': %s", city, e)
+        if key in cache:
+            log.warning("Geocoding '%s' failed (%s) — using cached bounds", city, e)
+            return cache[key]
+        log.warning("Geocoding failed for '%s' and no cache: %s", city, e)
         return None
+
+
+def geocode_city(city: str) -> str | None:
+    """Turn a city name into a CROUS search URL (cached bounds + current TOOL_ID)."""
+    bounds = _geocode_bounds(city)
+    if not bounds:
+        return None
+    url = f"{BASE}/tools/{TOOL_ID}/search?bounds={bounds}"
+    log.info("City '%s' -> %s", city, url)
+    return url
 
 
 def build_city_urls(cities: list[str]) -> list[tuple[str, str]]:
@@ -279,8 +304,14 @@ def total_count(html: str) -> int | None:
     return None
 
 
-def fetch_search(session: requests.Session, url: str) -> dict[str, dict]:
-    """Fetch all pages of one search URL and return {id: listing}."""
+def fetch_search(session: requests.Session, url: str) -> dict[str, dict] | None:
+    """Fetch all pages of one search URL.
+
+    Returns {id: listing} on success (possibly empty for a genuine 0 results),
+    or None if the fetch FAILED (network error, non-200, or an unexpected page
+    such as a maintenance screen). Returning None lets the caller skip the city
+    this cycle instead of mistaking an outage for 'every offer was removed'.
+    """
     all_listings: dict[str, dict] = {}
     prev_ids: set[str] = set()
 
@@ -290,11 +321,11 @@ def fetch_search(session: requests.Session, url: str) -> dict[str, dict]:
             r = session.get(page_url, timeout=25)
         except requests.RequestException as e:
             log.warning("Request failed (%s): %s", page_url, e)
-            break
+            return None  # transient error -> skip this city this cycle
 
         if r.status_code != 200:
             log.warning("HTTP %s for %s", r.status_code, page_url)
-            break
+            return None
 
         # The site sends no charset header, so requests would default to
         # Latin-1 and mangle accented characters. The pages are UTF-8.
@@ -307,9 +338,14 @@ def fetch_search(session: requests.Session, url: str) -> dict[str, dict]:
             cnt = total_count(r.text)
             log.info("  page 1: site reports %s total, %d cards parsed",
                      cnt if cnt is not None else "?", len(ids))
+            # A 200 with no cards AND no recognisable results headline is not a
+            # real "0 results" — it's a maintenance/soft-error page. Skip it.
+            if not ids and cnt is None:
+                log.warning("  unexpected page (no results headline) — treating as failure")
+                return None
 
         if not ids:
-            break  # no more results
+            break  # genuine end of results (cnt was 0 / 'Aucun logement')
         if ids == prev_ids:
             break  # site ignored ?page= — same page returned, stop
 
@@ -333,49 +369,27 @@ def load_state() -> dict:
     return {}
 
 
+def _atomic_write(path: str, text: str) -> None:
+    """Write to a temp file then replace, so a crash mid-write can't corrupt it."""
+    p = Path(path)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, p)  # atomic on the same filesystem
+
+
 def save_state(state: dict) -> None:
-    Path(STATE_FILE).write_text(
-        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    _atomic_write(STATE_FILE, json.dumps(state, ensure_ascii=False, indent=2))
 
 
 # --------------------------------------------------------------------------- #
 # Core cycle
 # --------------------------------------------------------------------------- #
+TELEGRAM_MAX = 4096  # hard limit of a single Telegram message
+
+
 def _md(text: str) -> str:
     """Neutralise Markdown-breaking characters in link text."""
     return text.replace("*", "").replace("_", "").replace("[", "(").replace("]", ")")
-
-
-def format_alert(label: str, url: str, new_listings: dict[str, dict]) -> str:
-    accs = list(new_listings.values())
-    n = len(accs)
-
-    # Header — city label if we have one, otherwise the cities seen in results.
-    if label:
-        zone = label
-    else:
-        cities = sorted({a["city"] for a in accs if a.get("city")})
-        zone = ", ".join(cities) if cities else "France"
-
-    plural = "s" if n > 1 else ""
-    lines = [f"🏠 *{n} nouvelle{plural} offre{plural} CROUS*", f"📍 _{zone}_", ""]
-
-    for i, acc in enumerate(accs[:15], 1):
-        title = _md(acc["title"])
-        city = acc.get("city") or zone
-        postal = f" ({acc['postal']})" if acc.get("postal") else ""
-        lines.append(f"*{i}. {title}*")
-        lines.append(f"💶 {acc['price']}   ·   🏙 {city}{postal}")
-        if acc.get("details"):
-            lines.append("🛏 " + " · ".join(acc["details"][:4]))
-        lines.append(f"[➡️ Voir l'offre]({acc['url']})")
-        lines.append("")
-
-    if n > 15:
-        lines.append(f"… et {n - 15} autre{'s' if n - 15 > 1 else ''} offre(s).")
-    lines.append(f"🔎 [Voir toute la recherche]({url})")
-    return "\n".join(lines)
 
 
 def _zone_of(label: str, items: list[dict]) -> str:
@@ -385,24 +399,67 @@ def _zone_of(label: str, items: list[dict]) -> str:
     return ", ".join(cities) if cities else "France"
 
 
+def _assemble(header: list[str], blocks: list[list[str]], footer: str) -> str:
+    """Join header + as many per-offer blocks as fit under the Telegram limit,
+    with a '… et N autre(s)' note when some are dropped, then the footer."""
+    budget = TELEGRAM_MAX - len("\n".join(header)) - len(footer) - 40
+    out, used, shown = list(header), 0, 0
+    for b in blocks:
+        btext = "\n".join(b) + "\n"
+        if used + len(btext) > budget:
+            break
+        out.extend(b)
+        out.append("")
+        used += len(btext)
+        shown += 1
+    dropped = len(blocks) - shown
+    if dropped > 0:
+        out.append(f"… et {dropped} autre{'s' if dropped > 1 else ''} offre(s).")
+    out.append(footer)
+    return "\n".join(out)
+
+
+def format_alert(label: str, url: str, new_listings: dict[str, dict]) -> str:
+    accs = list(new_listings.values())
+    n = len(accs)
+    zone = _zone_of(label, accs)
+    plural = "s" if n > 1 else ""
+    header = [f"🏠 *{n} nouvelle{plural} offre{plural} CROUS*", f"📍 _{zone}_", ""]
+
+    blocks = []
+    for i, acc in enumerate(accs, 1):
+        city = acc.get("city") or zone
+        postal = f" ({acc['postal']})" if acc.get("postal") else ""
+        block = [
+            f"*{i}. {_md(acc['title'])}*",
+            f"💶 {acc['price']}   ·   🏙 {city}{postal}",
+        ]
+        if acc.get("details"):
+            block.append("🛏 " + " · ".join(acc["details"][:4]))
+        block.append(f"[➡️ Voir l'offre]({acc['url']})")
+        blocks.append(block)
+
+    return _assemble(header, blocks, f"🔎 [Voir toute la recherche]({url})")
+
+
 def format_removed(label: str, url: str, removed: dict[str, dict]) -> str:
     items = list(removed.items())
     n = len(items)
     zone = _zone_of(label, [i[1] for i in items])
     plural = "s" if n > 1 else ""
-    lines = [f"❌ *{n} offre{plural} retirée{plural} CROUS*", f"📍 _{zone}_", ""]
-    for idx, (acc_id, acc) in enumerate(items[:15], 1):
-        title = _md(acc.get("title") or f"Offre {acc_id}")
+    header = [f"❌ *{n} offre{plural} retirée{plural} CROUS*", f"📍 _{zone}_", ""]
+
+    blocks = []
+    for idx, (acc_id, acc) in enumerate(items, 1):
         city = acc.get("city") or zone
         postal = f" ({acc['postal']})" if acc.get("postal") else ""
         price = acc.get("price")
-        lines.append(f"*{idx}. {title}*")
-        lines.append(f"💶 {price}   ·   🏙 {city}{postal}" if price else f"🏙 {city}{postal}")
-        lines.append("")
-    if n > 15:
-        lines.append(f"… et {n - 15} autre{'s' if n - 15 > 1 else ''} offre(s).")
-    lines.append(f"🔎 [Voir la recherche]({url})")
-    return "\n".join(lines)
+        blocks.append([
+            f"*{idx}. {_md(acc.get('title') or f'Offre {acc_id}')}*",
+            f"💶 {price}   ·   🏙 {city}{postal}" if price else f"🏙 {city}{postal}",
+        ])
+
+    return _assemble(header, blocks, f"🔎 [Voir la recherche]({url})")
 
 
 def _slim(acc: dict) -> dict:
@@ -414,6 +471,11 @@ def run_once(session: requests.Session, state: dict) -> None:
     for label, url in WATCHES:
         log.info("Checking%s: %s", f" [{label}]" if label else "", url)
         listings = fetch_search(session, url)
+        if listings is None:
+            # Fetch failed (network/HTTP/maintenance). Do NOT touch state or
+            # notify — otherwise an outage looks like 'all offers removed'.
+            log.info("  fetch failed — skipping this cycle (state unchanged)")
+            continue
         current_ids = set(listings)
 
         # Previous inventory. New format is {id: {details}}; tolerate the old
@@ -433,6 +495,10 @@ def run_once(session: requests.Session, state: dict) -> None:
         new_listings = {i: listings[i] for i in new_ids}
         removed_listings = {i: prev_map[i] for i in removed_ids}
 
+        # Start from the current inventory, then adjust so that offers whose
+        # notification FAILED are not acknowledged (they retry next cycle).
+        next_state = {i: _slim(listings[i]) for i in current_ids}
+
         seeding = first_time and not NOTIFY_ON_FIRST_RUN
         if seeding:
             log.info("  first run: seeding %d listings silently", len(current_ids))
@@ -441,15 +507,22 @@ def run_once(session: requests.Session, state: dict) -> None:
                 log.info("  %d NEW listing(s) -> notifying", len(new_listings))
                 if telegram_send(format_alert(label, url, new_listings)):
                     log.info("  new-offer notification sent.")
+                else:
+                    log.warning("  new-offer notification FAILED — will retry")
+                    for i in new_ids:  # forget them so they re-trigger next cycle
+                        next_state.pop(i, None)
             if removed_listings and NOTIFY_REMOVED:
                 log.info("  %d REMOVED listing(s) -> notifying", len(removed_listings))
                 if telegram_send(format_removed(label, url, removed_listings)):
                     log.info("  removed-offer notification sent.")
+                else:
+                    log.warning("  removed-offer notification FAILED — will retry")
+                    for i in removed_ids:  # keep them so removal re-triggers
+                        next_state[i] = prev_map[i]
             if not new_listings and not removed_listings:
                 log.info("  no changes (%d currently online)", len(current_ids))
 
-        # Persist the current inventory (with details) for the next comparison.
-        state[url] = {i: _slim(listings[i]) for i in current_ids}
+        state[url] = next_state
         save_state(state)
 
 

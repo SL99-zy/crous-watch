@@ -1,8 +1,12 @@
 # Never commit secrets or local state
 .env
 seen.json
+seen.json.tmp
+geocode_cache.json
+geocode_cache.json.tmp
 test_seen.json
 demo_seen.json
+*.tmp
 
 # Python
 .venv/
