@@ -89,6 +89,8 @@ STATE_FILE = os.environ.get("STATE_FILE", "seen.json")
 # On the very first run for a search, seed silently instead of alerting on the
 # entire current inventory. Set to "true" if you WANT the first batch too.
 NOTIFY_ON_FIRST_RUN = os.environ.get("NOTIFY_ON_FIRST_RUN", "false").lower() == "true"
+# Also send a ping when an offer that was online disappears from a city.
+NOTIFY_REMOVED = os.environ.get("NOTIFY_REMOVED", "true").lower() == "true"
 
 BASE = "https://trouverunlogement.lescrous.fr"
 USER_AGENT = (
@@ -376,30 +378,78 @@ def format_alert(label: str, url: str, new_listings: dict[str, dict]) -> str:
     return "\n".join(lines)
 
 
+def _zone_of(label: str, items: list[dict]) -> str:
+    if label:
+        return label
+    cities = sorted({a.get("city") for a in items if a.get("city")})
+    return ", ".join(cities) if cities else "France"
+
+
+def format_removed(label: str, url: str, removed: dict[str, dict]) -> str:
+    items = list(removed.items())
+    n = len(items)
+    zone = _zone_of(label, [i[1] for i in items])
+    plural = "s" if n > 1 else ""
+    lines = [f"❌ *{n} offre{plural} retirée{plural} CROUS*", f"📍 _{zone}_", ""]
+    for idx, (acc_id, acc) in enumerate(items[:15], 1):
+        title = _md(acc.get("title") or f"Offre {acc_id}")
+        city = acc.get("city") or zone
+        postal = f" ({acc['postal']})" if acc.get("postal") else ""
+        price = acc.get("price")
+        lines.append(f"*{idx}. {title}*")
+        lines.append(f"💶 {price}   ·   🏙 {city}{postal}" if price else f"🏙 {city}{postal}")
+        lines.append("")
+    if n > 15:
+        lines.append(f"… et {n - 15} autre{'s' if n - 15 > 1 else ''} offre(s).")
+    lines.append(f"🔎 [Voir la recherche]({url})")
+    return "\n".join(lines)
+
+
+def _slim(acc: dict) -> dict:
+    """Keep only the fields needed to describe an offer later (e.g. once removed)."""
+    return {k: acc.get(k) for k in ("title", "price", "city", "postal", "url")}
+
+
 def run_once(session: requests.Session, state: dict) -> None:
     for label, url in WATCHES:
         log.info("Checking%s: %s", f" [{label}]" if label else "", url)
         listings = fetch_search(session, url)
         current_ids = set(listings)
 
-        seen = set(state.get(url, []))
-        first_time = url not in state
+        # Previous inventory. New format is {id: {details}}; tolerate the old
+        # {url: [ids]} list format from earlier versions.
+        prev = state.get(url)
+        first_time = prev is None
+        if isinstance(prev, list):
+            prev_map = {i: {} for i in prev}
+        elif isinstance(prev, dict):
+            prev_map = prev
+        else:
+            prev_map = {}
+        seen = set(prev_map)
 
         new_ids = current_ids - seen
+        removed_ids = seen - current_ids
         new_listings = {i: listings[i] for i in new_ids}
+        removed_listings = {i: prev_map[i] for i in removed_ids}
 
-        if new_listings:
-            if first_time and not NOTIFY_ON_FIRST_RUN:
-                log.info("  first run: seeding %d listings silently", len(new_ids))
-            else:
+        seeding = first_time and not NOTIFY_ON_FIRST_RUN
+        if seeding:
+            log.info("  first run: seeding %d listings silently", len(current_ids))
+        else:
+            if new_listings:
                 log.info("  %d NEW listing(s) -> notifying", len(new_listings))
                 if telegram_send(format_alert(label, url, new_listings)):
-                    log.info("  Telegram notification sent.")
-        else:
-            log.info("  no new listings (%d currently online)", len(current_ids))
+                    log.info("  new-offer notification sent.")
+            if removed_listings and NOTIFY_REMOVED:
+                log.info("  %d REMOVED listing(s) -> notifying", len(removed_listings))
+                if telegram_send(format_removed(label, url, removed_listings)):
+                    log.info("  removed-offer notification sent.")
+            if not new_listings and not removed_listings:
+                log.info("  no changes (%d currently online)", len(current_ids))
 
-        # Persist the current inventory as "seen".
-        state[url] = sorted(current_ids)
+        # Persist the current inventory (with details) for the next comparison.
+        state[url] = {i: _slim(listings[i]) for i in current_ids}
         save_state(state)
 
 
