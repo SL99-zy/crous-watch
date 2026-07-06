@@ -357,7 +357,7 @@ def format_alert(label: str, url: str, new_listings: dict[str, dict]) -> str:
         zone = ", ".join(cities) if cities else "France"
 
     plural = "s" if n > 1 else ""
-    lines = [f"🏠 *{n} nouvelle{plural} offre{plural} CROUS* — 📍 _{zone}_", ""]
+    lines = [f"🏠 *{n} nouvelle{plural} offre{plural} CROUS*", f"📍 _{zone}_", ""]
 
     for i, acc in enumerate(accs[:15], 1):
         title = _md(acc["title"])
