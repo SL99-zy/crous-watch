@@ -6,9 +6,12 @@ name: crous-watch
 # ~5h55m, then the schedule starts a fresh job. Result: near-continuous 1-minute
 # checks, with only a short gap every ~6 hours.
 on:
-  schedule:
-    - cron: "0 */6 * * *"    # start a fresh 6-hour worker 4x/day
-  workflow_dispatch: {}       # and let you start one immediately by hand
+  # DISABLED: this project now runs 24/7 on an EC2 instance (see deploy/EC2-SETUP.md).
+  # Running both would send duplicate alerts. Re-enable the schedule below only if
+  # you stop the EC2 service.
+  # schedule:
+  #   - cron: "0 */6 * * *"
+  workflow_dispatch: {}       # manual-only; won't run on a schedule anymore
 
 concurrency:
   group: crous-watch          # never run two workers at once

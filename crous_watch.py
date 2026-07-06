@@ -78,6 +78,9 @@ CITIES = [c.strip() for c in os.environ.get("CITIES", "").split(",") if c.strip(
 # Needed to build URLs from CITIES. Find it in any URL copied from the site.
 TOOL_ID = os.environ.get("TOOL_ID", "42").strip()
 
+# Populated at startup: list of (label, url) zones to watch.
+WATCHES: list[tuple[str | None, str]] = []
+
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "300"))      # seconds between cycles
 JITTER = int(os.environ.get("JITTER", "60"))                     # random extra 0..JITTER s
 PAGE_DELAY = float(os.environ.get("PAGE_DELAY", "1.5"))          # polite delay between pages
@@ -164,15 +167,16 @@ def geocode_city(city: str) -> str | None:
         return None
 
 
-def build_city_urls(cities: list[str]) -> list[str]:
-    urls = []
+def build_city_urls(cities: list[str]) -> list[tuple[str, str]]:
+    """Return [(city_label, search_url), ...] for each geocodable city."""
+    pairs = []
     for i, city in enumerate(cities):
         url = geocode_city(city)
         if url:
-            urls.append(url)
+            pairs.append((city.strip().title(), url))
         if i < len(cities) - 1:
             time.sleep(1.1)  # Nominatim asks for <=1 request/second
-    return urls
+    return pairs
 
 
 def with_page(url: str, page: int) -> str:
@@ -218,25 +222,48 @@ def parse_cards(html: str) -> dict[str, dict]:
 
         # Prefer a real title; fall back to the anchor text.
         title = a.get_text(" ", strip=True)
-        card = a.find_parent(_is_card)
-        if card:
+        details: list[str] = []
+        if card := a.find_parent(_is_card):
             title_el = card.find(class_="fr-card__title")
             if title_el:
                 title = title_el.get_text(" ", strip=True)
             price = parse_price(card)
             desc_el = card.find("p", class_="fr-card__desc")
             desc = desc_el.get_text(" ", strip=True) if desc_el else ""
+            # Room facts: size, type, beds, amenities (li.fr-card__detail)
+            details = [
+                d.get_text(" ", strip=True)
+                for d in card.find_all(class_="fr-card__detail")
+                if d.get_text(strip=True)
+            ]
         else:
             price, desc = "prix n/a", ""
 
+        city, postal = parse_city(desc)
         full_url = href if href.startswith("http") else BASE + href
         found[acc_id] = {
             "title": title or f"Logement {acc_id}",
             "price": price,
             "desc": desc,
+            "details": details,
+            "city": city,
+            "postal": postal,
             "url": full_url,
         }
     return found
+
+
+def parse_city(address: str) -> tuple[str, str]:
+    """Extract (city, postal_code) from a French address string.
+    e.g. '22 avenue Jean Nicoli, BP 55, 20250 CORTE' -> ('Corte', '20250')."""
+    if not address:
+        return "", ""
+    matches = list(re.finditer(r"\b(\d{5})\b\s+(.+)$", address))
+    if not matches:
+        return "", ""
+    postal = matches[-1].group(1)
+    city = matches[-1].group(2).strip(" ,.-").title()
+    return city, postal
 
 
 def total_count(html: str) -> int | None:
@@ -313,25 +340,45 @@ def save_state(state: dict) -> None:
 # --------------------------------------------------------------------------- #
 # Core cycle
 # --------------------------------------------------------------------------- #
-def format_alert(url: str, new_listings: dict[str, dict]) -> str:
-    n = len(new_listings)
-    head = f"🏠 *{n} nouveau{'x' if n > 1 else ''} logement{'s' if n > 1 else ''} CROUS !*\n"
-    lines = [head]
-    for acc in list(new_listings.values())[:15]:
-        title = acc["title"].replace("*", "").replace("[", "(").replace("]", ")")
-        line = f"• [{title}]({acc['url']}) — {acc['price']}"
-        if acc.get("desc"):
-            line += f"\n  _{acc['desc'][:80]}_"
-        lines.append(line)
+def _md(text: str) -> str:
+    """Neutralise Markdown-breaking characters in link text."""
+    return text.replace("*", "").replace("_", "").replace("[", "(").replace("]", ")")
+
+
+def format_alert(label: str, url: str, new_listings: dict[str, dict]) -> str:
+    accs = list(new_listings.values())
+    n = len(accs)
+
+    # Header — city label if we have one, otherwise the cities seen in results.
+    if label:
+        zone = label
+    else:
+        cities = sorted({a["city"] for a in accs if a.get("city")})
+        zone = ", ".join(cities) if cities else "France"
+
+    plural = "s" if n > 1 else ""
+    lines = [f"🏠 *{n} nouvelle{plural} offre{plural} CROUS* — 📍 _{zone}_", ""]
+
+    for i, acc in enumerate(accs[:15], 1):
+        title = _md(acc["title"])
+        city = acc.get("city") or zone
+        postal = f" ({acc['postal']})" if acc.get("postal") else ""
+        lines.append(f"*{i}. {title}*")
+        lines.append(f"💶 {acc['price']}   ·   🏙 {city}{postal}")
+        if acc.get("details"):
+            lines.append("🛏 " + " · ".join(acc["details"][:4]))
+        lines.append(f"[➡️ Voir l'offre]({acc['url']})")
+        lines.append("")
+
     if n > 15:
-        lines.append(f"…and {n - 15} more.")
-    lines.append(f"\n🔎 [Voir la recherche]({url})")
+        lines.append(f"… et {n - 15} autre{'s' if n - 15 > 1 else ''} offre(s).")
+    lines.append(f"🔎 [Voir toute la recherche]({url})")
     return "\n".join(lines)
 
 
 def run_once(session: requests.Session, state: dict) -> None:
-    for url in SEARCH_URLS:
-        log.info("Checking: %s", url)
+    for label, url in WATCHES:
+        log.info("Checking%s: %s", f" [{label}]" if label else "", url)
         listings = fetch_search(session, url)
         current_ids = set(listings)
 
@@ -346,7 +393,7 @@ def run_once(session: requests.Session, state: dict) -> None:
                 log.info("  first run: seeding %d listings silently", len(new_ids))
             else:
                 log.info("  %d NEW listing(s) -> notifying", len(new_listings))
-                if telegram_send(format_alert(url, new_listings)):
+                if telegram_send(format_alert(label, url, new_listings)):
                     log.info("  Telegram notification sent.")
         else:
             log.info("  no new listings (%d currently online)", len(current_ids))
@@ -375,13 +422,15 @@ def main() -> int:
         ok = telegram_send("✅ crous-watch test message — Telegram is wired up correctly.")
         return 0 if ok else 1
 
-    # Resolve city names to search URLs and merge with any explicit SEARCH_URLS.
-    global SEARCH_URLS
+    # Build the watch list: (label, url) pairs. Cities carry their name as label;
+    # explicit SEARCH_URLS have no label (city is then read from each listing).
+    global WATCHES
+    WATCHES = [(None, u) for u in SEARCH_URLS]
     if CITIES:
         log.info("Resolving %d city name(s) to search zones…", len(CITIES))
-        SEARCH_URLS = SEARCH_URLS + build_city_urls(CITIES)
+        WATCHES = WATCHES + build_city_urls(CITIES)
 
-    if not SEARCH_URLS:
+    if not WATCHES:
         log.error("Nothing to watch. Set CITIES or SEARCH_URLS in .env (see .env.example).")
         return 1
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -399,8 +448,8 @@ def main() -> int:
         run_once(session, state)
         return 0
 
-    log.info("Starting loop: %d search(es), every ~%ds (+0..%ds jitter). Ctrl+C to stop.",
-             len(SEARCH_URLS), POLL_INTERVAL, JITTER)
+    log.info("Starting loop: %d zone(s), every ~%ds (+0..%ds jitter). Ctrl+C to stop.",
+             len(WATCHES), POLL_INTERVAL, JITTER)
     while True:
         try:
             run_once(session, state)
