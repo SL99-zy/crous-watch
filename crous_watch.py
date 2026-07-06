@@ -566,7 +566,7 @@ def main() -> int:
         return 0
 
     if args.test:
-        ok = telegram_send("✅ crous-watch test message — Telegram is wired up correctly.")
+        ok = telegram_send("✅ crous-watch test message. Telegram is wired up correctly.")
         return 0 if ok else 1
 
     # Build the watch list: (label, url) pairs. Cities carry their name as label;
