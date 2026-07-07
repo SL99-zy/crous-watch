@@ -208,6 +208,15 @@ def build_city_urls(cities: list[str]) -> list[tuple[str, str]]:
     return pairs
 
 
+def label_from_url(url: str) -> str | None:
+    """Use the search URL's `locationName` query param as the zone label,
+    e.g. '...&locationName=Reims+%2851100%29' -> 'Reims'."""
+    name = parse_qs(urlparse(url).query).get("locationName", [None])[0]
+    if not name:
+        return None
+    return name.split(" (")[0].strip() or None  # drop the postal suffix
+
+
 def with_page(url: str, page: int) -> str:
     """Return url with its 'page' query parameter set to `page`."""
     parts = urlparse(url)
@@ -572,7 +581,7 @@ def main() -> int:
     # Build the watch list: (label, url) pairs. Cities carry their name as label;
     # explicit SEARCH_URLS have no label (city is then read from each listing).
     global WATCHES
-    WATCHES = [(None, u) for u in SEARCH_URLS]
+    WATCHES = [(label_from_url(u), u) for u in SEARCH_URLS]
     if CITIES:
         log.info("Resolving %d city name(s) to search zones…", len(CITIES))
         WATCHES = WATCHES + build_city_urls(CITIES)
