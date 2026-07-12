@@ -567,6 +567,7 @@ def main() -> int:
     ap.add_argument("--once", action="store_true", help="run a single pass then exit")
     ap.add_argument("--test", action="store_true", help="send a Telegram test message")
     ap.add_argument("--reset", action="store_true", help="clear the seen-state file")
+    ap.add_argument("--send", metavar="TEXT", help="send a custom message then exit")
     args = ap.parse_args()
 
     if args.reset:
@@ -576,6 +577,11 @@ def main() -> int:
 
     if args.test:
         ok = telegram_send("✅ crous-watch test message. Telegram is wired up correctly.")
+        return 0 if ok else 1
+
+    if args.send:
+        ok = telegram_send(args.send)
+        log.info("Custom message sent." if ok else "Custom message FAILED.")
         return 0 if ok else 1
 
     # Build the watch list: (label, url) pairs. Cities carry their name as label;
